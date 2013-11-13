@@ -41,6 +41,9 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
 
   config_param :append, :bool, :default => true
 
+  config_param :compressed,          :bool,    :default => false
+  config_param :compressed_tmpdir,   :string,  :default => Dir.tmpdir
+
   CHUNK_ID_PLACE_HOLDER = '${chunk_id}'
 
   def initialize
@@ -48,6 +51,8 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
     require 'net/http'
     require 'time'
     require 'webhdfs'
+    require 'zlib'
+    require 'tempfile'
   end
 
   def configure(conf)
@@ -187,17 +192,32 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
       @client.create(path, data, {'overwrite' => 'true'})
     end
   end
-
+  
   def write(chunk)
-    hdfs_path = if @append
+    hdfs_path = if @append and !@compressed
                   path_format(chunk.key)
                 else
                   path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
                 end
 
     failovered = false
+
     begin
-      send_data(hdfs_path, chunk.read)
+      if @compressed
+        temp = Tempfile.new('compressed', @compressed_tmpdir)
+        
+        w = Zlib::GzipWriter.new(temp)
+        
+        chunk.write_to(w)
+        
+        w.close
+
+        File.open(Pathname.new(temp.path)) do |io_temp|
+          @client.create(hdfs_path, io_temp, {'overwrite' => 'true'})
+        end
+      else
+        send_data(hdfs_path, chunk.read)
+      end
     rescue => e
       $log.warn "failed to communicate hdfs cluster, path: #{hdfs_path}"
 
