@@ -205,7 +205,7 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
     suffix = case @compressed
              when nil
                ''
-             when :gz
+             when true
                ".gz"
              end
 
@@ -214,28 +214,30 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
                else
                  path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
                end
-    hdfs_path
-
     i = 0
+    path = nil
 
     hdfs_path = begin
-                  path = "#{@path_prefix}#{int_path}_#{i}#{@path_suffix}#{suffix}"
-                  i += 1
+                  begin
+                    path = "#{int_path}_#{i}#{suffix}"
+                    i += 1
+                  end while @client.stat(path)
                 rescue WebHDFS::FileNotFoundError
                   path 
-                end while @client.stat(path)
+                end 
+
+    @client.mkdir(File.dirname(hdfs_path))
 
     failovered = false
 
     begin
       if @compressed
-        Timefile.open('compressed, @compressed_tmpdir') do |f|
-          IO.popen('gzip', 'w', :out => f.fileno) do 
+        Tempfile.open('compressed', @compressed_tmpdir) do |f|
+          IO.popen('gzip', 'w', :out => f.fileno) do |f|
             chunk.write_to(f) 
           end
 
-          # uncomment out if something goes wrong with temp file
-          # f.rewind 
+          f.rewind 
 
           @client.create(hdfs_path, f.read, {'overwrite' => 'true'})
         end
