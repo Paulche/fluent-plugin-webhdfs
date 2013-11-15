@@ -65,6 +65,14 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
         conf['time_slice_format'] = '%Y%m%d%H'
       end
     end
+      
+    if @compressed
+      begin
+        Open3.capture3('gzip -V')
+      rescue Errno::ENOENT
+        raise ConfigError, "'gzip' utility must be in PATH for compression"
+      end
+    end
 
     super
 
@@ -194,26 +202,42 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
   end
   
   def write(chunk)
-    hdfs_path = if @append and !@compressed
-                  path_format(chunk.key)
-                else
-                  path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
-                end
+    suffix = case @compressed
+             when nil
+               ''
+             when :gz
+               ".gz"
+             end
+
+    int_path = if @append and !@compressed
+                 path_format(chunk.key)
+               else
+                 path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
+               end
+    hdfs_path
+
+    i = 0
+
+    hdfs_path = begin
+                  path = "#{@path_prefix}#{int_path}_#{i}#{@path_suffix}#{suffix}"
+                  i += 1
+                rescue WebHDFS::FileNotFoundError
+                  path 
+                end while @client.stat(path)
 
     failovered = false
 
     begin
       if @compressed
-        temp = Tempfile.new('compressed', @compressed_tmpdir)
-        
-        w = Zlib::GzipWriter.new(temp)
-        
-        chunk.write_to(w)
-        
-        w.close
+        Timefile.open('compressed, @compressed_tmpdir') do |f|
+          IO.popen('gzip', 'w', :out => f.fileno) do 
+            chunk.write_to(f) 
+          end
 
-        File.open(Pathname.new(temp.path)) do |io_temp|
-          @client.create(hdfs_path, io_temp, {'overwrite' => 'true'})
+          # uncomment out if something goes wrong with temp file
+          # f.rewind 
+
+          @client.create(hdfs_path, f.read, {'overwrite' => 'true'})
         end
       else
         send_data(hdfs_path, chunk.read)
