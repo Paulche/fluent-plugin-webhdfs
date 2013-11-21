@@ -6,6 +6,22 @@ require 'fluent/mixin/plaintextformatter'
 class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
   Fluent::Plugin.register_output('webhdfs', self)
 
+  COMPRESS_SUPPORTED = {
+    'gz'   => :gz,
+    'gzip' => :gz,
+    'lzop' => :lzo
+  }
+
+  COMPRESS_EXECUTABLE = {
+    :gz  => 'gzip',
+    :lzo => 'lzop'
+  }
+
+  COMPRESS_EXTENSION = {
+    :gz  => 'gz',
+    :lzo => 'lzo'
+  }
+
   config_set_default :buffer_type, 'memory'
   config_set_default :time_slice_format, '%Y%m%d'
 
@@ -41,6 +57,16 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
 
   config_param :append, :bool, :default => true
 
+  config_param :compress, :default => nil do |val|
+    c = COMPRESS_SUPPORTED[val]
+    unless c
+      raise ConfigError, "Unsupported compression algorithm '#{val}'"
+    end
+    c
+  end
+
+  config_param :compress_tmpdir,   :string,  :default => Dir.tmpdir
+
   CHUNK_ID_PLACE_HOLDER = '${chunk_id}'
 
   def initialize
@@ -48,10 +74,13 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
     require 'net/http'
     require 'time'
     require 'webhdfs'
+    require 'zlib'
+    require 'tempfile'
+    require 'open3'
   end
 
   def configure(conf)
-    if conf['path']
+    if conf['path'] 
       if conf['path'].index('%S')
         conf['time_slice_format'] = '%Y%m%d%H%M%S'
       elsif conf['path'].index('%M')
@@ -60,6 +89,8 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
         conf['time_slice_format'] = '%Y%m%d%H'
       end
     end
+      
+    check_compress_method(@compress)
 
     super
 
@@ -99,6 +130,16 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
     if not @append
       if @path.index(CHUNK_ID_PLACE_HOLDER).nil?
         raise Fluent::ConfigError, "path must contain ${chunk_id}, which is the placeholder for chunk_id, when append is set to false."
+      end
+    end
+  end
+
+  def check_compress_method(method)
+    if method
+      begin
+        Open3.capture3("#{COMPRESS_EXECUTABLE[method]} -V")
+      rescue Errno::ENOENT
+        raise ConfigError, "'#{COMPRESS_EXECUTABLE[method]}' utility must be in PATH for compression"
       end
     end
   end
@@ -188,16 +229,68 @@ class Fluent::WebHDFSOutput < Fluent::TimeSlicedOutput
     end
   end
 
+  def compressed_write(chunk, hdfs_path, executable)
+    Tempfile.open('compress', @compress_tmpdir) do |temp_file|
+      IO.pipe do |r,w|
+        child_pid = Kernel.fork do 
+          Process.setsid
+          w.close
+          $stdin.reopen(r)
+          $stdout.reopen(File.new(temp_file.path,'w'))
+          Kernel.exec(executable)
+        end
+
+        r.close
+
+        begin
+          chunk.write_to(w)
+        rescue Errno::EPIPE
+          Process.waitpid(child_pid)
+        end
+
+        w.close
+
+        Process.waitpid(child_pid)
+      end
+          
+      @client.create(hdfs_path, temp_file.read, {'overwrite' => 'true'})
+    end
+  end
+  
   def write(chunk)
-    hdfs_path = if @append
-                  path_format(chunk.key)
-                else
-                  path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
+    suffix =  if @compress
+                ".#{COMPRESS_EXTENSION[@compress]}"
+              else
+                ''
+              end
+
+    int_path = if @append and !@compress
+                 path_format(chunk.key)
+               else
+                 path_format(chunk.key).gsub(CHUNK_ID_PLACE_HOLDER, chunk_unique_id_to_str(chunk.unique_id))
+               end
+    i = 0
+    path = nil
+
+    hdfs_path = begin
+                  begin
+                    path = "#{int_path}_#{i}#{suffix}"
+                    i += 1
+                  end while @client.stat(path)
+                rescue WebHDFS::FileNotFoundError
+                  path 
                 end
 
+    @client.mkdir(File.dirname(hdfs_path))
+    
     failovered = false
+
     begin
-      send_data(hdfs_path, chunk.read)
+      if @compress
+        compressed_write(chunk, hdfs_path, COMPRESS_EXECUTABLE[@compress])
+      else
+        send_data(hdfs_path, chunk.read)
+      end
     rescue => e
       $log.warn "failed to communicate hdfs cluster, path: #{hdfs_path}"
 
